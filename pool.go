@@ -25,6 +25,7 @@ type Pool struct {
 	closing       chan struct{}
 	tlsConfig     *tls.Config
 	helloHostname string
+	forceUseTLS   bool
 }
 
 type client struct {
@@ -44,15 +45,16 @@ var (
 	ErrTimeout = errors.New("timed out")
 )
 
-func NewPool(address string, count int, auth smtp.Auth, opt_tlsConfig ...*tls.Config) (pool *Pool, err error) {
+func NewPool(address string, count int, auth smtp.Auth, forceUserTLS bool, opt_tlsConfig ...*tls.Config) (pool *Pool, err error) {
 	pool = &Pool{
-		addr:    address,
-		auth:    auth,
-		max:     count,
-		clients: make(chan *client, count),
-		rebuild: make(chan struct{}),
-		closing: make(chan struct{}),
-		mut:     &sync.Mutex{},
+		addr:        address,
+		auth:        auth,
+		max:         count,
+		clients:     make(chan *client, count),
+		rebuild:     make(chan struct{}),
+		closing:     make(chan struct{}),
+		mut:         &sync.Mutex{},
+		forceUseTLS: forceUserTLS,
 	}
 	if len(opt_tlsConfig) == 1 {
 		pool.tlsConfig = opt_tlsConfig[0]
@@ -205,9 +207,24 @@ func addAuth(c *client, auth smtp.Auth) (bool, error) {
 }
 
 func (p *Pool) build() (*client, error) {
-	cl, err := smtp.Dial(p.addr)
-	if err != nil {
-		return nil, err
+
+	var cl *smtp.Client
+	var err error
+
+	if p.forceUseTLS {
+		conn, err1 := tls.Dial("tcp", p.addr, p.tlsConfig)
+		if err1 != nil {
+			return nil, err1
+		}
+		cl, err = smtp.NewClient(conn, p.tlsConfig.ServerName)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cl, err = smtp.Dial(p.addr)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Is there a custom hostname for doing a HELLO with the SMTP server?
@@ -217,9 +234,11 @@ func (p *Pool) build() (*client, error) {
 
 	c := &client{cl, 0}
 
-	if _, err := startTLS(c, p.tlsConfig); err != nil {
-		c.Close()
-		return nil, err
+	if !p.forceUseTLS {
+		if _, err := startTLS(c, p.tlsConfig); err != nil {
+			c.Close()
+			return nil, err
+		}
 	}
 
 	if p.auth != nil {
